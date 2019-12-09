@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Whatsapp scraper
 // @namespace    http://tampermonkey.net/
-// @version      0.1
+// @version      0.2
 // @description  Scrape all content from a selected whatsapp conversation
 // @author       Frederik Duchi
 // @match        https://web.whatsapp.com/
@@ -81,21 +81,41 @@
         return [];
     };
 
-    const startDownload = async (path, filename) => {
-        const data = await fetch(path).then(response => {
-            return response.blob();
-        }).catch(() => {
-            return ``;
-        });
+    const convertDataUriToBlob = dataURI => {
+        const byteString = atob(dataURI.split(',')[1]);
+        // separate out the mime component
+        const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0]
 
-        return data;
+        // write the bytes of the string to an ArrayBuffer
+        const ab = new ArrayBuffer(byteString.length);
+        const ia = new Uint8Array(ab);
+        for (let i = 0; i < byteString.length; i++) {
+            ia[i] = byteString.charCodeAt(i);
+        }
+
+        // write the ArrayBuffer to a blob, and you're done
+        var bb = new Blob([ab]);
+        return bb;
+    }
+
+    const startDownload = async (path) => {
+        if (path.startsWith(`data:image/`)) {
+            return convertDataUriToBlob(path);
+        } else {
+            const data = await fetch(path).then(response => {
+                return response.blob();
+            }).catch(() => {
+                return ``;
+            });
+
+            return data;
+        }
     };
 
-    const getMediaURL = async $element => {
+    const getMediaURL = async ($element, $header) => {
         return await new Promise(resolve => {
             let counter = 0;
             const id = setInterval(() => {
-                console.log(counter);
                 if (counter === 10 || $element.getAttribute(`src`).startsWith(`blob:https://`)) {
                     resolve($element.getAttribute(`src`));
                     clearInterval(id);
@@ -105,13 +125,12 @@
         });
     };
 
-    const getVideoURL = async () => {
+    const getVideoURL = async ($header) => {
         return await new Promise(resolve => {
             let counter = 0;
             const id = setInterval(() => {
-                console.log(counter);
-                // video was not found
                 if (counter === 10) {
+                    // video was not found
                     resolve(`file not found`);
                     clearInterval(id);
                 }
@@ -125,7 +144,7 @@
         });
     };
 
-    const getMedia = async ($message, filename) => {
+    const getMedia = async ($message, filename, $header) => {
         // check for an image
         const $image_container = $message.querySelector(`._3mdDl`);
         if ($image_container) {
@@ -136,14 +155,11 @@
                 $download_button.click();
             }
 
-            const url = await getMediaURL($img);
-            const file = await startDownload(url, filename);
+            $header.textContent += ` (ophalen van afbeelding)`;
+            const url = await getMediaURL($img, $header);
+            const file = await startDownload(url);
 
-            if (url.startsWith(`data:image`)) {
-                return { type: "image", path: `${filename}.jpeg`, status: `preview`, file: file };
-            } else {
-                return { type: "image", path: `${filename}.jpeg`, status: `ok`, file: file };
-            }
+            return { type: "image", path: `${filename}.jpeg`, file: file };
         }
 
         // check for a video
@@ -151,13 +167,12 @@
         if ($video_container) {
             $video_container.click();
 
-            const url = await getVideoURL();
+            $header.textContent += ` (ophalen van video)`;
+            const url = await getVideoURL($header);
 
             if (url !== `file not found`) {
-                const file = await startDownload(url, filename);
-                return { type: "video", path: `${filename}.mp4`, status: `ok`, file: file };
-            } else {
-                return { type: "video", path: ``, status: `not_found`, file: `` };
+                const file = await startDownload(url);
+                return { type: "video", path: `${filename}.mp4`, file: file };
             }
         }
 
@@ -166,22 +181,22 @@
         if ($gif_container) {
             const $video = $gif_container.querySelector(`video`);
             const url = $video.getAttribute(`src`);
-            const file = await startDownload(url, filename);
+            $header.textContent += ` (ophalen van media video)`;
+            const file = await startDownload(url);
 
-            return { type: "gif", path: `${filename}.mp4`, status: `ok`, file: file };
+            return { type: "video", path: `${filename}.mp4`, file: file };
         }
 
-        return { type: `no_media`, path: ``, status: `not_found`, file: `` };
+        return {};
     };
 
-    const parseConversationLine = async (title, messages, item, id) => {
+    const parseConversationLine = async (title, $header, messages, item) => {
         const $message = messages[item];
         if ($message) {
             // only parse incoming and outgoing messages, deny all other types (status updates from whatsapp)
             if ($message.classList.contains(`message-in`) || $message.classList.contains(`message-out`)) {
                 const message = {};
-                message.id = id;
-                console.log(`parsing message with id ${id}`);
+                $header.textContent = `parsing message ${item} / ${messages.length}`;
 
                 // set the author, date and time depending on the first copyable-text in the line. Format is [hh:mm, m/d/yyyy] Author:
                 // copyable-text is not set for messages only containing media: fallback is implementend in methods
@@ -196,19 +211,18 @@
                 message.emojis = getEmojis($message);
 
                 // check if the message contains media
-                message.media = await getMedia($message, `wae_${id}`);
+                message.media = await getMedia($message, `wae_${item}`, $header);
 
                 json_conversation.push(message);
-                //return message;
-
-                id++;
             }
             item++;
-            parseConversationLine(title, messages, item, id);
+            parseConversationLine(title, $header, messages, item);
         } else {
             // remove any open containers if required
             document.querySelector(`._2sTOw`).innerHTML = ``;
+            $header.textContent = `All messages parsed, start creating zip file`;
             createZipFile(title);
+            console.log(json_conversation);
         }
     };
 
@@ -218,9 +232,7 @@
         folder.file(`conversation.json`, JSON.stringify(json_conversation));
 
         json_conversation.forEach(message => {
-            console.log(message.media.type);
-
-            if (message.media.path !== ``) {
+            if (message.media.path) {
                 console.log(`add ${message.media.path}`);
                 folder.file(message.media.path, message.media.file);
             }
@@ -237,61 +249,34 @@
         json_conversation = [];
     };
 
-    const parseConversation = (title, $header_container) => {
-        $header_container.innerHTML = `start parsing...`;
-
-        // select all messages from the conversation
-        const messages = document.querySelectorAll(`.FTBzM`);
-
-        parseConversationLine(title, messages, 0, 1);
+    const parseConversation = (title, $header_container, messages) => {
+        // parse the first line and start recursive function
+        parseConversationLine(title, $header_container, messages, 0);
     };
-
-    /*
-    const getLastDate = $container => {
-        const $last_date = $container.querySelector(`._3CGDY > .a7otO`);
-        return $last_date.textContent;
-    };
-    */
 
     const handleClickDownload = e => {
         // get the title of the conversation
         const $header_container = document.querySelector(`._3fs0K`);
         const title = $header_container.querySelector(`._19vo_`).textContent;
 
-        // array that holds the last 10 scroll positions.  If all 10 items are equal means that we have reached the top of the conversation
-        const lastScrolls = [];
-
-        // selecting the scrollable message container
         const $scroll_container = document.querySelector(`._1_keJ`);
+        $scroll_container.addEventListener(`scroll`, () => {
+            if ($scroll_container.scrollTop === 0) {
+                const currentAmount = document.querySelectorAll(`.FTBzM`).length;
+                $header_container.textContent = `Collecting ${currentAmount} messages and counting...`;
 
-        // show message that the scrolling has started
-        $header_container.innerHTML = `srcolling to the beginning of the conversation, might take a while depending on the length of the conversation`;
+                setTimeout(() => {
+                    $scroll_container.scrollTo({ top: 0, left: 0 });
+                    const messages = document.querySelectorAll(`.FTBzM`);
+                    if (messages.length <= currentAmount || currentAmount > 1000) {
+                        $header_container.textContent = `Reached top of conversation, parsing ${messages.length} messages`;
+                        parseConversation(title, $header_container, messages);
+                    }
+                }, 2000);
 
-        // start scrolling to the top and check if the top is reached
-        const id = setInterval(() => {
-            const amount = document.querySelectorAll(`.FTBzM`).length;
-
-            // TEMP HACK FOR LARGE CONVERSATIONS: ONLY DOWNLOAD 200 MESSAGES
-            if (amount > 1000) {
-                clearInterval(id);
-                $header_container.innerHTML = `the top of the conversation has been reached, start parsing ${amount} items`;
-                parseConversation(title, $header_container);
             }
-
-            $header_container.innerHTML = `scrolling to the beginning of the conversation.  Amount of messages: ${amount}`;
-            lastScrolls.push($scroll_container.scrollTop);
-            if (lastScrolls.length === 10) {
-                if (lastScrolls.every(x => x === lastScrolls[0])) {
-                    clearInterval(id);
-                    $header_container.innerHTML = `the top of the conversation has been reached, start parsing ${amount} items`;
-                    parseConversation(title, $header_container);
-                } else {
-                    lastScrolls.length = 0;
-                }
-            }
-
-            $scroll_container.scrollTo({ top: 1, left: 0, behavior: 'smooth' });
-        }, 100);
+        });
+        $scroll_container.scrollTo({ top: 0, left: 0 });
     };
 
     const addDownloadButton = () => {
@@ -316,6 +301,7 @@
         }
         // add a download button once a conversation is found
         addDownloadButton();
+
     };
 
     start();
